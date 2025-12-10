@@ -96,8 +96,22 @@ function TvMode() {
   }, []);
 
   useEffect(() => {
+    if (state.workout && state.workout.parts && state.workout.parts.length > 0) {
+        setWorkout(state.workout);
+    }
+  }, [state.workout]);
+
+  useEffect(() => {
+      if (state.timerVal !== undefined) {
+          setDisplayTime(state.timerVal);
+      }
+  }, [state.timerVal]);
+
+  useEffect(() => {
     let interval;
-    if (state.timerRunning) interval = setInterval(() => setDisplayTime(t => t + 1), 1000);
+    if (state.timerRunning) {
+        interval = setInterval(() => setDisplayTime(t => t + 1), 1000);
+    }
     return () => clearInterval(interval);
   }, [state.timerRunning]);
 
