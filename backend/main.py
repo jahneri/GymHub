@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+import time
 from datetime import datetime
 from typing import List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -11,7 +12,7 @@ import google.generativeai as genai
 app = FastAPI()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-DB_PATH = "/data/gym.db"
+DB_PATH = os.getenv("DB_PATH", "/data/gym.db")
 
 GYM_INVENTORY = """
 LOCATION A: KELLER (Haupt-Gym)
@@ -118,6 +119,37 @@ def ask_coach_gem(participants: List[str]):
         print(e)
         return {"focus": "Error", "parts": []}
 
+# Global State
+class GymState:
+    def __init__(self):
+        self.timer_running = False
+        self.timer_value = 0.0
+        self.start_time = 0.0
+        self.rounds = {}
+        self.workout = {"parts": []}
+
+    def to_dict(self):
+        current_time = self.timer_value
+        if self.timer_running:
+            current_time += (time.time() - self.start_time)
+
+        return {
+            "timerRunning": self.timer_running,
+            "timerVal": int(current_time),
+            "rounds": self.rounds,
+            "workout": self.workout
+        }
+
+gym_state = GymState()
+try:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT json_data FROM workouts ORDER BY created_at DESC LIMIT 1").fetchone()
+    conn.close()
+    if row:
+        gym_state.workout = json.loads(row[0])
+except:
+    pass
+
 class ConnectionManager:
     def __init__(self): self.active_connections: List[WebSocket] = []
     async def connect(self, ws: WebSocket): await ws.accept(); self.active_connections.append(ws)
@@ -131,22 +163,54 @@ manager = ConnectionManager()
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    # Send initial state
+    await websocket.send_json({"type": "STATE_UPDATE", "payload": gym_state.to_dict()})
+
     try:
         while True:
             data = await websocket.receive_json()
-            if data.get('type') == 'ACTION' and data.get('payload', {}).get('action') == 'GENERATE_WOD':
-                user = data.get('payload', {}).get('user', 'u_richard')
-                parts = ["Richard", "Nina"] if "Nina" in user else ["Richard"]
-                new_plan = ask_coach_gem(parts)
+
+            if data.get('type') == 'ACTION':
+                action = data.get('payload', {}).get('action')
+                user = data.get('payload', {}).get('user')
                 
-                w_id = f"wod_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("INSERT INTO workouts VALUES (?, ?, ?, ?)", (w_id, datetime.now().strftime('%Y-%m-%d'), json.dumps(new_plan), datetime.now().isoformat()))
-                conn.commit()
-                conn.close()
-                await manager.broadcast({"type": "STATE_UPDATE", "payload": {"workout": new_plan}})
-            else:
-                await manager.broadcast(data)
+                if action == 'GENERATE_WOD':
+                    parts = ["Richard", "Nina"] if "Nina" in (user or "") else ["Richard"]
+                    new_plan = ask_coach_gem(parts)
+
+                    w_id = f"wod_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute("INSERT INTO workouts VALUES (?, ?, ?, ?)", (w_id, datetime.now().strftime('%Y-%m-%d'), json.dumps(new_plan), datetime.now().isoformat()))
+                    conn.commit()
+                    conn.close()
+
+                    gym_state.workout = new_plan
+                    # Broadcast State Update happens at the end
+
+                elif action == 'TOGGLE_TIMER':
+                    if gym_state.timer_running:
+                        # Stop
+                        gym_state.timer_value += (time.time() - gym_state.start_time)
+                        gym_state.timer_running = False
+                    else:
+                        # Start
+                        gym_state.start_time = time.time()
+                        gym_state.timer_running = True
+
+                elif action == 'ADD_ROUND':
+                    if user:
+                        gym_state.rounds[user] = gym_state.rounds.get(user, 0) + 1
+
+                elif action == 'RESET_TIMER':
+                    gym_state.timer_running = False
+                    gym_state.timer_value = 0
+
+                elif action == 'RESET_ROUNDS':
+                    gym_state.rounds = {}
+
+                # Broadcast new state
+                await manager.broadcast({"type": "STATE_UPDATE", "payload": gym_state.to_dict()})
+
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
