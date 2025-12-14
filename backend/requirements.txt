@@ -1,5 +1,9 @@
 fastapi
 uvicorn[standard]
+google-genai
 google-generativeai>=0.8.3
 pydantic
 websockets
+python-multipart
+gTTS
+pyaudio
