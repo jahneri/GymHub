@@ -4,6 +4,7 @@ import { User, Play, Square, Plus, RotateCcw, Monitor, Smartphone, Dumbbell, His
 const HOST = window.location.hostname || 'localhost';
 const API_URL = `http://${HOST}:8000`;
 const WS_URL = `ws://${HOST}:8000/ws`;
+const N8N_BASE = 'http://raspberrypi.local:5678/webhook-test';
 
 const MOCK_USERS = [
   { id: 'u_richard', name: 'Richard', role: 'admin', color: 'blue', initials: 'RI' },
@@ -157,7 +158,7 @@ function TvMode() {
           lastExplainedIndexRef.current = activePartIndex;
           setSpeaking(true);
           
-          fetch(`${API_URL}/tts`, {
+          fetch(`${N8N_BASE}/tts`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ text: part.tv_script })
@@ -358,165 +359,74 @@ function AdminMode({ onBack, onHistory }) {
   
   // Chat State
   const [recording, setRecording] = useState(false);
-  const audioContextRef = useRef(null);
-  const processorRef = useRef(null);
-  const sourceRef = useRef(null);
-  const wsRef = useRef(null);
-  const streamRef = useRef(null);
-  const audioQueueRef = useRef([]);
-  const isPlayingRef = useRef(false);
-  const responseTimeoutRef = useRef(null);
+  const [mediaRecorder, setMediaRecorder] = useState(null);
 
-  const closeConnection = () => {
-      if (wsRef.current) {
-          wsRef.current.close();
-          wsRef.current = null;
-      }
-  };
-
-  const playNextChunk = async () => {
-    // Reset timeout - we're still getting audio
-    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
-    responseTimeoutRef.current = setTimeout(() => {
-        console.log("No audio chunks received for 15 seconds (AdminMode), closing connection");
-        closeConnection();
-    }, 15000); // Increased to 15 seconds for AI response
-
-    if (audioQueueRef.current.length === 0) {
-        isPlayingRef.current = false;
-        return;
-    }
-    isPlayingRef.current = true;
-    const chunk = audioQueueRef.current.shift();
-    
+  const startRecording = async () => {
     try {
-        const audioCtx = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-        audioContextRef.current = audioCtx;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+      
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const formData = new FormData();
+        formData.append('audio', blob, 'recording.webm');
+        formData.append('user', 'admin'); // Assuming admin role in this view
         
-        const arrayBuffer = await chunk.arrayBuffer();
-        const int16 = new Int16Array(arrayBuffer);
-        const float32 = new Float32Array(int16.length);
-        for(let i=0; i<int16.length; i++) float32[i] = int16[i] / 32768.0;
-        
-        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
-        buffer.getChannelData(0).set(float32);
-        
-        const source = audioCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioCtx.destination);
-        source.onended = playNextChunk;
-        source.start();
-        
-    } catch(e) { console.error("Audio playback error", e); isPlayingRef.current = false; }
+        // Visual feedback that we are waiting
+        setGenerating(true); // Re-use generating state or create new one for 'thinking'
+
+        try {
+            const res = await fetch(`${N8N_BASE}/talk`, { method: 'POST', body: formData });
+            if (res.ok) {
+                const audioBlob = await res.blob();
+                const url = URL.createObjectURL(audioBlob);
+                new Audio(url).play();
+            } else {
+                console.error("Coach talk failed");
+            }
+        } catch(e) { console.error(e); }
+        finally { setGenerating(false); }
+      };
+      
+      recorder.start();
+      setMediaRecorder(recorder);
+      setRecording(true);
+    } catch(e) { console.error("Mic error", e); }
   };
 
-  const toggleRecording = async (e) => {
+  const stopRecording = () => {
+    mediaRecorder?.stop();
+    setRecording(false);
+  };
+
+  const toggleRecording = (e) => {
       e.preventDefault();
-      
-      // If already recording, stop and close connection
-      if (recording) {
-          console.log("Stopping conversation and closing connection (AdminMode)");
-          closeConnection();
-          
-          // Stop mic
-          if (processorRef.current) {
-              processorRef.current.disconnect();
-              processorRef.current = null;
-          }
-          if (sourceRef.current) {
-              sourceRef.current.disconnect();
-              sourceRef.current = null;
-          }
-          if (streamRef.current) {
-              streamRef.current.getTracks().forEach(t => t.stop());
-              streamRef.current = null;
-          }
-          
-          setRecording(false);
-          return;
-      }
-      
-      // Start new conversation
-      try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: {
-              channelCount: 1,
-              echoCancellation: true,
-              noiseSuppression: true
-          }});
-          streamRef.current = stream;
-          
-          // Create AudioContext - use native sample rate and resample to 16kHz
-          if (!audioContextRef.current) {
-              audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-          }
-          const ctx = audioContextRef.current;
-          const nativeSampleRate = ctx.sampleRate;
-          console.log(`AudioContext sample rate: ${nativeSampleRate} Hz (will resample to 16000 Hz)`);
-          
-          wsRef.current = new WebSocket(`ws://${HOST}:8000/live/audio`);
-          wsRef.current.binaryType = 'arraybuffer';
-          
-          wsRef.current.onopen = () => {
-              setRecording(true);
-              console.log("Connected to Live API - conversation started (AdminMode)");
-          };
-          
-          wsRef.current.onmessage = (event) => {
-              console.log("Received audio chunk from Pablo (AdminMode), size:", event.data.byteLength || event.data.length);
-              const audioBlob = new Blob([event.data], { type: 'audio/pcm' });
-              audioQueueRef.current.push(audioBlob);
-              if (!isPlayingRef.current) playNextChunk();
-          };
-          
-          wsRef.current.onerror = (error) => {
-              console.error("WebSocket error (AdminMode):", error);
-              setRecording(false);
-          };
-          
-          wsRef.current.onclose = () => {
-              console.log("WebSocket closed (AdminMode)");
-              setRecording(false);
-          };
-
-          sourceRef.current = ctx.createMediaStreamSource(stream);
-          processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
-          
-          // Resampling buffer for converting to 16kHz
-          const targetSampleRate = 16000;
-          const resampleRatio = nativeSampleRate / targetSampleRate;
-          
-          processorRef.current.onaudioprocess = (audioEvent) => {
-              if (wsRef.current?.readyState === WebSocket.OPEN) {
-                  const inputData = audioEvent.inputBuffer.getChannelData(0);
-                  
-                  // Resample from native rate to 16kHz
-                  const outputLength = Math.floor(inputData.length / resampleRatio);
-                  const pcmData = new Int16Array(outputLength);
-                  
-                  for (let i = 0; i < outputLength; i++) {
-                      const srcIndex = Math.floor(i * resampleRatio);
-                      const sample = Math.max(-1, Math.min(1, inputData[srcIndex]));
-                      pcmData[i] = sample * 0x7FFF;
-                  }
-                  
-                  wsRef.current.send(pcmData.buffer);
-              }
-          };
-          
-          sourceRef.current.connect(processorRef.current);
-          processorRef.current.connect(ctx.destination);
-          
-      } catch(e) { 
-          console.error("Mic error", e);
-          setRecording(false);
-      }
+      if (recording) stopRecording();
+      else startRecording();
   };
 
-  const handleGenerate = () => {
+  const handleGenerate = async () => {
       setGenerating(true);
-      send('ACTION', { action: 'GENERATE_WOD', custom_prompt: prompt });
-      setPrompt(''); 
-      setTimeout(() => setGenerating(false), 2000); // Simple visual feedback
+      try {
+          const res = await fetch(`${N8N_BASE}/wod`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                  participants: ['Richard', 'Nina'],
+                  custom_prompt: prompt || ''
+              })
+          });
+          const plan = await res.json();
+          // Push plan into backend state via WS for TV/Remote
+          send('ACTION', { action: 'SET_WORKOUT', workout: plan });
+          setPrompt('');
+      } catch (e) {
+          console.error('WOD generation via n8n failed', e);
+      } finally {
+          setGenerating(false);
+      }
   };
 
   return (
@@ -550,7 +460,7 @@ function AdminMode({ onBack, onHistory }) {
                     </span>
                 </button>
                 <div className="text-center text-slate-500 text-xs mt-2 uppercase tracking-widest">
-                    {recording ? 'Click again to end. Pablo will respond automatically.' : 'Click to start talking. Pablo will respond automatically.'}
+                    {recording ? 'Click again to send. Pablo will respond.' : 'Click to start talking. Click again to send.'}
                 </div>
               </div>
 
@@ -624,163 +534,56 @@ function RemoteMode({ user, onBack }) {
   
   // Chat State
   const [recording, setRecording] = useState(false);
-  const audioContextRef = useRef(null);
-  const processorRef = useRef(null);
-  const sourceRef = useRef(null);
-  const wsRef = useRef(null);
-  const streamRef = useRef(null);
-  const audioQueueRef = useRef([]);
-  const isPlayingRef = useRef(false);
-  const responseTimeoutRef = useRef(null);
+  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [thinking, setThinking] = useState(false);
 
   const activeIndex = state.activePartIndex || 0;
   const parts = state.workout?.parts || [];
   const currentPart = parts[activeIndex];
   const totalParts = parts.length;
 
-  const closeConnection = () => {
-      if (wsRef.current) {
-          wsRef.current.close();
-          wsRef.current = null;
-      }
-  };
-
-  const playNextChunk = async () => {
-    // Reset timeout - we're still getting audio
-    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
-    responseTimeoutRef.current = setTimeout(() => {
-        console.log("No audio chunks received for 15 seconds, closing connection");
-        closeConnection();
-    }, 15000); // Increased to 15 seconds for AI response
-
-    if (audioQueueRef.current.length === 0) {
-        isPlayingRef.current = false;
-        return;
-    }
-    isPlayingRef.current = true;
-    const chunk = audioQueueRef.current.shift();
-    
+  const startRecording = async () => {
     try {
-        const audioCtx = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-        audioContextRef.current = audioCtx;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+      
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const formData = new FormData();
+        formData.append('audio', blob, 'recording.webm');
+        formData.append('user', user.name);
         
-        const arrayBuffer = await chunk.arrayBuffer();
-        const int16 = new Int16Array(arrayBuffer);
-        const float32 = new Float32Array(int16.length);
-        for(let i=0; i<int16.length; i++) float32[i] = int16[i] / 32768.0;
-        
-        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
-        buffer.getChannelData(0).set(float32);
-        
-        const source = audioCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioCtx.destination);
-        source.onended = playNextChunk;
-        source.start();
-        
-    } catch(e) { console.error("Audio playback error", e); isPlayingRef.current = false; }
+        setThinking(true);
+        try {
+            const res = await fetch(`${N8N_BASE}/talk`, { method: 'POST', body: formData });
+            if (res.ok) {
+                const audioBlob = await res.blob();
+                const url = URL.createObjectURL(audioBlob);
+                new Audio(url).play();
+            } else {
+                console.error("Coach talk failed");
+            }
+        } catch(e) { console.error(e); }
+        finally { setThinking(false); }
+      };
+      
+      recorder.start();
+      setMediaRecorder(recorder);
+      setRecording(true);
+    } catch(e) { console.error("Mic error", e); }
   };
 
-  const toggleRecording = async (e) => {
-      e.preventDefault();
-      
-      // If already recording, stop and close connection
-      if (recording) {
-          console.log("Stopping conversation and closing connection (RemoteMode)");
-          closeConnection();
-          
-          // Stop mic
-          if (processorRef.current) {
-              processorRef.current.disconnect();
-              processorRef.current = null;
-          }
-          if (sourceRef.current) {
-              sourceRef.current.disconnect();
-              sourceRef.current = null;
-          }
-          if (streamRef.current) {
-              streamRef.current.getTracks().forEach(t => t.stop());
-              streamRef.current = null;
-          }
-          
-          setRecording(false);
-          return;
-      }
-      
-      // Start new conversation
-      try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: {
-              channelCount: 1,
-              echoCancellation: true,
-              noiseSuppression: true
-          }});
-          streamRef.current = stream;
-          
-          // Create AudioContext - use native sample rate and resample to 16kHz
-          if (!audioContextRef.current) {
-              audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-          }
-          const ctx = audioContextRef.current;
-          const nativeSampleRate = ctx.sampleRate;
-          console.log(`AudioContext sample rate: ${nativeSampleRate} Hz (will resample to 16000 Hz)`);
-          
-          wsRef.current = new WebSocket(`ws://${HOST}:8000/live/audio`);
-          wsRef.current.binaryType = 'arraybuffer';
-          
-          wsRef.current.onopen = () => {
-              setRecording(true);
-              console.log("Connected to Live API - conversation started (RemoteMode)");
-          };
-          
-          wsRef.current.onmessage = (event) => {
-              console.log("Received audio chunk from Pablo (RemoteMode), size:", event.data.byteLength || event.data.length);
-              const audioBlob = new Blob([event.data], { type: 'audio/pcm' });
-              audioQueueRef.current.push(audioBlob);
-              if (!isPlayingRef.current) playNextChunk();
-          };
-          
-          wsRef.current.onerror = (error) => {
-              console.error("WebSocket error (RemoteMode):", error);
-              setRecording(false);
-          };
-          
-          wsRef.current.onclose = () => {
-              console.log("WebSocket closed (RemoteMode)");
-              setRecording(false);
-          };
+  const stopRecording = () => {
+    mediaRecorder?.stop();
+    setRecording(false);
+  };
 
-          sourceRef.current = ctx.createMediaStreamSource(stream);
-          processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
-          
-          // Resampling buffer for converting to 16kHz
-          const targetSampleRate = 16000;
-          const resampleRatio = nativeSampleRate / targetSampleRate;
-          
-          processorRef.current.onaudioprocess = (audioEvent) => {
-              if (wsRef.current?.readyState === WebSocket.OPEN) {
-                  const inputData = audioEvent.inputBuffer.getChannelData(0);
-                  
-                  // Resample from native rate to 16kHz
-                  const outputLength = Math.floor(inputData.length / resampleRatio);
-                  const pcmData = new Int16Array(outputLength);
-                  
-                  for (let i = 0; i < outputLength; i++) {
-                      const srcIndex = Math.floor(i * resampleRatio);
-                      const sample = Math.max(-1, Math.min(1, inputData[srcIndex]));
-                      pcmData[i] = sample * 0x7FFF;
-                  }
-                  
-                  wsRef.current.send(pcmData.buffer);
-              }
-          };
-          
-          sourceRef.current.connect(processorRef.current);
-          processorRef.current.connect(ctx.destination);
-          
-      } catch(e) { 
-          console.error("Mic error", e);
-          setRecording(false);
-      }
+  const toggleRecording = (e) => {
+      e.preventDefault();
+      if (recording) stopRecording();
+      else startRecording();
   };
 
   const handleLog = (data) => {
@@ -837,16 +640,21 @@ function RemoteMode({ user, onBack }) {
 
          <button 
             onClick={toggleRecording}
+            disabled={thinking}
             className={`w-full h-20 rounded-3xl flex items-center justify-center gap-4 font-bold uppercase transition-all active:scale-95 shadow-lg select-none ${
                 recording ? 'bg-red-600 text-white animate-pulse' : 
+                thinking ? 'bg-slate-700 text-slate-400' :
                 'bg-indigo-600 text-white hover:bg-indigo-500'
             }`}
          >
              <Mic size={32} />
              <span className="text-xl tracking-widest">
-                 {recording ? 'End Conversation' : 'Start Conversation with Pablo'}
+                 {recording ? 'End Conversation' : thinking ? 'Coach is thinking...' : 'Start Conversation with Pablo'}
              </span>
          </button>
+         <div className="text-center text-slate-500 text-xs uppercase tracking-widest">
+             {recording ? 'Click again to send.' : thinking ? 'Wait...' : 'Tap to start recording. Tap again to stop & send.'}
+         </div>
 
          <div className="bg-slate-900 rounded-3xl p-5 border border-slate-800 flex-grow overflow-y-auto shadow-inner flex flex-col">
             <div className="flex justify-between items-center mb-3 border-b border-slate-800 pb-2 gap-2">

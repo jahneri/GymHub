@@ -5,11 +5,17 @@ services:
     build: ./backend
     container_name: gym_backend
     command: uvicorn main:app --host 0.0.0.0 --port 8000
-    volumes:
-      - ./data:/data
+    depends_on:
+      - postgres
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=gymhub
+      - DB_USER=gymhub
+      - DB_PASSWORD=gymhub
     restart: unless-stopped
 
   web:
@@ -24,5 +30,44 @@ services:
       - api
     restart: unless-stopped
 
+  postgres:
+    image: postgres:15-alpine
+    container_name: gym_postgres
+    environment:
+      - POSTGRES_USER=gymhub
+      - POSTGRES_PASSWORD=gymhub
+      - POSTGRES_DB=gymhub
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # Expose for n8n access
+    restart: unless-stopped
+
+  # Include n8n in the same stack for easier management
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: gym_n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_PORT=5678
+      - N8N_HOST=raspberrypi.local
+      - N8N_EDITOR_BASE_URL=http://raspberrypi.local:5678/
+      - N8N_PROTOCOL=http
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=n8n
+      - GENERIC_TIMEZONE=Europe/Berlin
+    volumes:
+      - ./n8n/data:/workspace/data
+      - ./n8n/exports:/home/node/.n8n/exports
+      - ./n8n/files:/files
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
 volumes:
-  data:
+  postgres-data:

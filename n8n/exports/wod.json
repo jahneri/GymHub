@@ -1,0 +1,47 @@
+[
+  {
+    "name": "WOD Generator",
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "wod",
+          "options": {}
+        },
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 1,
+        "position": [
+          100,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "mode": "json",
+          "json": "{\n  \"focus\": \"Full Body\",\n  \"parts\": [\n    {\n      \"type\": \"Warmup\",\n      \"duration_min\": 10,\n      \"content\": [\"Jumping Jacks\", \"Squats\"]\n    }\n  ]\n}"
+        },
+        "name": "Dummy WOD",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 1,
+        "position": [
+          300,
+          300
+        ]
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "Dummy WOD",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    }
+  }
+]

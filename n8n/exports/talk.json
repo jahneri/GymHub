@@ -1,0 +1,47 @@
+[
+  {
+    "name": "Talk",
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "talk",
+          "options": {}
+        },
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 1,
+        "position": [
+          100,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "mode": "json",
+          "json": "={\n  \"text\": \"Hallo, ich bin Pablo! Wie kann ich helfen?\",\n  \"audio_url\": \"http://example.com/audio.mp3\"\n}"
+        },
+        "name": "Dummy Response",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 1,
+        "position": [
+          300,
+          300
+        ]
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "Dummy Response",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    }
+  }
+]
