@@ -158,7 +158,11 @@ function TvMode() {
           lastExplainedIndexRef.current = activePartIndex;
           setSpeaking(true);
           
+<<<<<<< HEAD
           fetch(`${N8N_BASE}/tts`, {
+=======
+          fetch(`${API_URL}/tts`, {
+>>>>>>> d38c103
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ text: part.tv_script })
@@ -359,7 +363,149 @@ function AdminMode({ onBack, onHistory }) {
   
   // Chat State
   const [recording, setRecording] = useState(false);
+<<<<<<< HEAD
   const [mediaRecorder, setMediaRecorder] = useState(null);
+=======
+  const [waitingResponse, setWaitingResponse] = useState(false);
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const sourceRef = useRef(null);
+  const wsRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const responseTimeoutRef = useRef(null);
+  const hasSentEndRef = useRef(false);
+
+  const closeConnection = () => {
+      if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+      }
+      setWaitingResponse(false);
+  };
+
+  const playNextChunk = async () => {
+    // Reset timeout - we're still getting audio
+    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
+    responseTimeoutRef.current = setTimeout(() => {
+        closeConnection();
+    }, 5000);
+
+    if (audioQueueRef.current.length === 0) {
+        isPlayingRef.current = false;
+        return;
+    }
+    isPlayingRef.current = true;
+    const chunk = audioQueueRef.current.shift();
+    
+    try {
+        const audioCtx = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        audioContextRef.current = audioCtx;
+        
+        const arrayBuffer = await chunk.arrayBuffer();
+        const int16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(int16.length);
+        for(let i=0; i<int16.length; i++) float32[i] = int16[i] / 32768.0;
+        
+        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        source.onended = playNextChunk;
+        source.start();
+        
+    } catch(e) { console.error("Audio playback error", e); isPlayingRef.current = false; }
+  };
+
+  const startRecording = async (e) => {
+      e.preventDefault();
+      if (waitingResponse) return; // Don't start new recording while waiting
+      hasSentEndRef.current = false;
+      
+      try {
+          if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          const ctx = audioContextRef.current;
+          
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+              sampleRate: 16000,
+              channelCount: 1,
+              echoCancellation: true
+          }});
+          streamRef.current = stream;
+          
+          wsRef.current = new WebSocket(`ws://${HOST}:8000/live/audio`);
+          wsRef.current.binaryType = 'arraybuffer';
+          
+          wsRef.current.onopen = () => {
+              setRecording(true);
+              console.log("Connected to Live API");
+          };
+          
+          wsRef.current.onmessage = (event) => {
+              const audioBlob = new Blob([event.data], { type: 'audio/pcm' });
+              audioQueueRef.current.push(audioBlob);
+              if (!isPlayingRef.current) playNextChunk();
+          };
+          
+          wsRef.current.onclose = () => {
+              setWaitingResponse(false);
+              setRecording(false);
+          };
+
+          sourceRef.current = ctx.createMediaStreamSource(stream);
+          processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
+          
+          processorRef.current.onaudioprocess = (e) => {
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  const inputData = e.inputBuffer.getChannelData(0);
+                  const pcmData = new Int16Array(inputData.length);
+                  for (let i = 0; i < inputData.length; i++) {
+                      pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                  }
+                  wsRef.current.send(pcmData.buffer);
+              }
+          };
+          
+          sourceRef.current.connect(processorRef.current);
+          processorRef.current.connect(ctx.destination);
+          
+      } catch(e) { console.error("Mic error", e); }
+  };
+
+  const stopRecording = (e) => {
+      if (e) e.preventDefault();
+      setRecording(false);
+      
+      // Stop mic but keep WS open for response
+      if (processorRef.current) {
+          processorRef.current.disconnect();
+          processorRef.current = null;
+      }
+      if (sourceRef.current) {
+          sourceRef.current.disconnect();
+          sourceRef.current = null;
+      }
+      if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+          streamRef.current = null;
+      }
+      
+      // If WS is open, send END signal and wait for response
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+          if (!hasSentEndRef.current) {
+              hasSentEndRef.current = true;
+              wsRef.current.send("END"); // Signal to backend that user is done speaking
+          }
+          setWaitingResponse(true);
+          responseTimeoutRef.current = setTimeout(() => {
+              closeConnection();
+          }, 10000);
+      }
+  };
+>>>>>>> d38c103
 
   const startRecording = async () => {
     try {
@@ -448,20 +594,35 @@ function AdminMode({ onBack, onHistory }) {
               {/* Voice Chat Button */}
               <div className="mb-6">
                 <button 
+<<<<<<< HEAD
                     onClick={toggleRecording}
                     className={`w-full py-6 rounded-2xl font-bold uppercase transition-all active:scale-95 shadow-lg flex items-center justify-center gap-3 ${
+=======
+                    onMouseDown={startRecording} onMouseUp={stopRecording} onMouseLeave={stopRecording}
+                    onTouchStart={startRecording} onTouchEnd={stopRecording}
+                    disabled={waitingResponse}
+                    className={`w-full py-6 rounded-2xl font-bold uppercase transition-all active:scale-95 shadow-lg flex items-center justify-center gap-3 ${
+                        waitingResponse ? 'bg-amber-600 text-white animate-pulse' :
+>>>>>>> d38c103
                         recording ? 'bg-red-600 text-white animate-pulse' : 
                         'bg-indigo-600 text-white hover:bg-indigo-500'
                     }`}
                 >
                     <Mic size={24} />
                     <span className="text-lg tracking-widest">
+<<<<<<< HEAD
                         {recording ? 'End Conversation' : 'Start Conversation with Pablo'}
                     </span>
                 </button>
                 <div className="text-center text-slate-500 text-xs mt-2 uppercase tracking-widest">
                     {recording ? 'Click again to send. Pablo will respond.' : 'Click to start talking. Click again to send.'}
                 </div>
+=======
+                        {waitingResponse ? 'Pablo antwortet...' : recording ? 'Listening...' : 'Hold to Talk to Pablo'}
+                    </span>
+                </button>
+                <div className="text-center text-slate-500 text-xs mt-2 uppercase tracking-widest">Ask about history, inventory or get motivated</div>
+>>>>>>> d38c103
               </div>
 
               <div className="border-t border-slate-800 my-6"></div>
@@ -534,14 +695,28 @@ function RemoteMode({ user, onBack }) {
   
   // Chat State
   const [recording, setRecording] = useState(false);
+<<<<<<< HEAD
   const [mediaRecorder, setMediaRecorder] = useState(null);
   const [thinking, setThinking] = useState(false);
+=======
+  const [waitingResponse, setWaitingResponse] = useState(false);
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const sourceRef = useRef(null);
+  const wsRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const responseTimeoutRef = useRef(null);
+  const hasSentEndRef = useRef(false);
+>>>>>>> d38c103
 
   const activeIndex = state.activePartIndex || 0;
   const parts = state.workout?.parts || [];
   const currentPart = parts[activeIndex];
   const totalParts = parts.length;
 
+<<<<<<< HEAD
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -584,6 +759,134 @@ function RemoteMode({ user, onBack }) {
       e.preventDefault();
       if (recording) stopRecording();
       else startRecording();
+=======
+  const closeConnection = () => {
+      if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+      }
+      setWaitingResponse(false);
+  };
+
+  const playNextChunk = async () => {
+    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
+    responseTimeoutRef.current = setTimeout(() => {
+        closeConnection();
+    }, 2000);
+
+    if (audioQueueRef.current.length === 0) {
+        isPlayingRef.current = false;
+        return;
+    }
+    isPlayingRef.current = true;
+    const chunk = audioQueueRef.current.shift();
+    
+    try {
+        const audioCtx = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        audioContextRef.current = audioCtx;
+        
+        const arrayBuffer = await chunk.arrayBuffer();
+        const int16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(int16.length);
+        for(let i=0; i<int16.length; i++) float32[i] = int16[i] / 32768.0;
+        
+        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        source.onended = playNextChunk;
+        source.start();
+        
+    } catch(e) { console.error("Audio playback error", e); isPlayingRef.current = false; }
+  };
+
+  const startRecording = async (e) => {
+      e.preventDefault();
+      if (waitingResponse) return;
+      hasSentEndRef.current = false;
+      
+      try {
+          if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          const ctx = audioContextRef.current;
+          
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+              sampleRate: 16000,
+              channelCount: 1,
+              echoCancellation: true
+          }});
+          streamRef.current = stream;
+          
+          wsRef.current = new WebSocket(`ws://${HOST}:8000/live/audio`);
+          wsRef.current.binaryType = 'arraybuffer';
+          
+          wsRef.current.onopen = () => {
+              setRecording(true);
+              console.log("Connected to Live API");
+          };
+          
+          wsRef.current.onmessage = (event) => {
+              const audioBlob = new Blob([event.data], { type: 'audio/pcm' });
+              audioQueueRef.current.push(audioBlob);
+              if (!isPlayingRef.current) playNextChunk();
+          };
+          
+          wsRef.current.onclose = () => {
+              setWaitingResponse(false);
+              setRecording(false);
+          };
+
+          sourceRef.current = ctx.createMediaStreamSource(stream);
+          processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
+          
+          processorRef.current.onaudioprocess = (e) => {
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  const inputData = e.inputBuffer.getChannelData(0);
+                  const pcmData = new Int16Array(inputData.length);
+                  for (let i = 0; i < inputData.length; i++) {
+                      pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                  }
+                  wsRef.current.send(pcmData.buffer);
+              }
+          };
+          
+          sourceRef.current.connect(processorRef.current);
+          processorRef.current.connect(ctx.destination);
+          
+      } catch(e) { console.error("Mic error", e); }
+  };
+
+  const stopRecording = (e) => {
+      if (e) e.preventDefault();
+      setRecording(false);
+      
+      // Stop mic but keep WS open for response
+      if (processorRef.current) {
+          processorRef.current.disconnect();
+          processorRef.current = null;
+      }
+      if (sourceRef.current) {
+          sourceRef.current.disconnect();
+          sourceRef.current = null;
+      }
+      if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+          streamRef.current = null;
+      }
+      
+      // If WS is open, send END signal and wait for response
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+          if (!hasSentEndRef.current) {
+              hasSentEndRef.current = true;
+              wsRef.current.send("END"); // Signal to backend that user is done speaking
+          }
+          setWaitingResponse(true);
+          responseTimeoutRef.current = setTimeout(() => {
+              closeConnection();
+          }, 10000);
+      }
+>>>>>>> d38c103
   };
 
   const handleLog = (data) => {
@@ -639,22 +942,37 @@ function RemoteMode({ user, onBack }) {
          </div>
 
          <button 
+<<<<<<< HEAD
             onClick={toggleRecording}
             disabled={thinking}
             className={`w-full h-20 rounded-3xl flex items-center justify-center gap-4 font-bold uppercase transition-all active:scale-95 shadow-lg select-none ${
                 recording ? 'bg-red-600 text-white animate-pulse' : 
                 thinking ? 'bg-slate-700 text-slate-400' :
+=======
+            onMouseDown={startRecording} onMouseUp={stopRecording} onMouseLeave={stopRecording}
+            onTouchStart={startRecording} onTouchEnd={stopRecording}
+            disabled={waitingResponse}
+            className={`w-full h-20 rounded-3xl flex items-center justify-center gap-4 font-bold uppercase transition-all active:scale-95 shadow-lg select-none ${
+                waitingResponse ? 'bg-amber-600 text-white animate-pulse' :
+                recording ? 'bg-red-600 text-white animate-pulse' : 
+>>>>>>> d38c103
                 'bg-indigo-600 text-white hover:bg-indigo-500'
             }`}
          >
              <Mic size={32} />
              <span className="text-xl tracking-widest">
+<<<<<<< HEAD
                  {recording ? 'End Conversation' : thinking ? 'Coach is thinking...' : 'Start Conversation with Pablo'}
              </span>
          </button>
          <div className="text-center text-slate-500 text-xs uppercase tracking-widest">
              {recording ? 'Click again to send.' : thinking ? 'Wait...' : 'Tap to start recording. Tap again to stop & send.'}
          </div>
+=======
+                 {waitingResponse ? 'Pablo antwortet...' : recording ? 'Listening...' : 'Talk to Pablo'}
+             </span>
+         </button>
+>>>>>>> d38c103
 
          <div className="bg-slate-900 rounded-3xl p-5 border border-slate-800 flex-grow overflow-y-auto shadow-inner flex flex-col">
             <div className="flex justify-between items-center mb-3 border-b border-slate-800 pb-2 gap-2">
