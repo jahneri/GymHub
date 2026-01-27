@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { User, Play, Square, Plus, RotateCcw, Monitor, Smartphone, Dumbbell, History, Wifi, Baby, Settings, X, Check, ChevronLeft, ChevronRight } from 'lucide-react';
+import { User, Play, Square, Plus, RotateCcw, Monitor, Smartphone, Dumbbell, History, Wifi, Baby, Settings, X, Check, ChevronLeft, ChevronRight, Mic, Volume2 } from 'lucide-react';
 
 const HOST = window.location.hostname || 'localhost';
 const API_URL = `http://${HOST}:8000`;
@@ -59,7 +59,8 @@ export default function App() {
   };
 
   if (view === 'tv') return <TvMode />;
-  if (view === 'admin') return <AdminMode onBack={() => setView('home')} />;
+  if (view === 'admin') return <AdminMode onBack={() => setView('home')} onHistory={() => setView('history')} />;
+  if (view === 'history') return <HistoryMode onBack={() => setView('admin')} />;
   if (view === 'remote' && user) {
       if (user.role === 'kid') return <KidsMode user={user} onBack={() => setView('home')} />;
       return <RemoteMode user={user} onBack={() => setView('home')} />;
@@ -129,10 +130,12 @@ function TvMode() {
   const { state } = useGymSocket();
   const [workout, setWorkout] = useState(null);
   const [displayTime, setDisplayTime] = useState(0);
+  const [speaking, setSpeaking] = useState(false);
   const lastTimeRef = useRef(0);
   const runningRef = useRef(false);
   const partRefs = useRef([]);
   const activePartIndex = state.activePartIndex || 0;
+  const lastExplainedIndexRef = useRef(-1);
 
   useEffect(() => {
     fetch(`${API_URL}/workout/current`).then(r => r.json()).then(setWorkout).catch(() => {});
@@ -143,6 +146,35 @@ function TvMode() {
         setWorkout(state.workout);
     }
   }, [state.workout]);
+
+  // Coach Explanation Logic
+  useEffect(() => {
+      if (!workout || !workout.parts) return;
+      if (activePartIndex === lastExplainedIndexRef.current) return;
+      
+      const part = workout.parts[activePartIndex];
+      if (part && part.tv_script) {
+          lastExplainedIndexRef.current = activePartIndex;
+          setSpeaking(true);
+          
+          fetch(`${API_URL}/tts`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: part.tv_script })
+          })
+          .then(res => res.blob())
+          .then(blob => {
+              const url = URL.createObjectURL(blob);
+              const audio = new Audio(url);
+              audio.onended = () => setSpeaking(false);
+              audio.play().catch(e => {
+                  console.error("Auto-play failed", e);
+                  setSpeaking(false);
+              });
+          })
+          .catch(() => setSpeaking(false));
+      }
+  }, [activePartIndex, workout]);
 
   useEffect(() => {
       if (state.timerVal !== undefined) {
@@ -262,7 +294,10 @@ function TvMode() {
   return (
     <div className="h-screen bg-black text-white p-8 grid grid-cols-1 lg:grid-cols-[1fr_350px] gap-8 font-sans overflow-hidden">
       <div className="space-y-6 overflow-y-auto pr-4">
-        <h1 className="text-4xl font-black uppercase text-slate-400">Today's Mission</h1>
+        <h1 className="text-4xl font-black uppercase text-slate-400 flex items-center gap-4">
+            Today's Mission
+            {speaking && <span className="text-blue-500 animate-pulse flex items-center gap-2 text-lg normal-case font-bold"><Volume2/> Listen to Coach</span>}
+        </h1>
         {workout?.parts && workout.parts.length > 0 ? workout.parts.map((part, i) => (
             <div key={i} ref={el => partRefs.current[i] = el} className={`bg-slate-900 p-6 rounded-3xl border-l-8 border-blue-600 shadow-lg transition-all duration-500 ${i === activePartIndex ? 'opacity-100 scale-100 ring-4 ring-blue-500/50' : 'opacity-30 scale-95 grayscale'}`}>
                 <h2 className="text-3xl font-bold mb-4 flex items-center gap-3">
@@ -315,11 +350,153 @@ function TvMode() {
   );
 }
 
-function AdminMode({ onBack }) {
+function AdminMode({ onBack, onHistory }) {
   const { state, send } = useGymSocket();
   const [prompt, setPrompt] = useState('');
   const [showConfig, setShowConfig] = useState(false);
   const [generating, setGenerating] = useState(false);
+  
+  // Chat State
+  const [recording, setRecording] = useState(false);
+  const [waitingResponse, setWaitingResponse] = useState(false);
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const sourceRef = useRef(null);
+  const wsRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const responseTimeoutRef = useRef(null);
+  const hasSentEndRef = useRef(false);
+
+  const closeConnection = () => {
+      if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+      }
+      setWaitingResponse(false);
+  };
+
+  const playNextChunk = async () => {
+    // Reset timeout - we're still getting audio
+    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
+    responseTimeoutRef.current = setTimeout(() => {
+        closeConnection();
+    }, 5000);
+
+    if (audioQueueRef.current.length === 0) {
+        isPlayingRef.current = false;
+        return;
+    }
+    isPlayingRef.current = true;
+    const chunk = audioQueueRef.current.shift();
+    
+    try {
+        const audioCtx = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        audioContextRef.current = audioCtx;
+        
+        const arrayBuffer = await chunk.arrayBuffer();
+        const int16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(int16.length);
+        for(let i=0; i<int16.length; i++) float32[i] = int16[i] / 32768.0;
+        
+        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        source.onended = playNextChunk;
+        source.start();
+        
+    } catch(e) { console.error("Audio playback error", e); isPlayingRef.current = false; }
+  };
+
+  const startRecording = async (e) => {
+      e.preventDefault();
+      if (waitingResponse) return; // Don't start new recording while waiting
+      hasSentEndRef.current = false;
+      
+      try {
+          if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          const ctx = audioContextRef.current;
+          
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+              sampleRate: 16000,
+              channelCount: 1,
+              echoCancellation: true
+          }});
+          streamRef.current = stream;
+          
+          wsRef.current = new WebSocket(`ws://${HOST}:8000/live/audio`);
+          wsRef.current.binaryType = 'arraybuffer';
+          
+          wsRef.current.onopen = () => {
+              setRecording(true);
+              console.log("Connected to Live API");
+          };
+          
+          wsRef.current.onmessage = (event) => {
+              const audioBlob = new Blob([event.data], { type: 'audio/pcm' });
+              audioQueueRef.current.push(audioBlob);
+              if (!isPlayingRef.current) playNextChunk();
+          };
+          
+          wsRef.current.onclose = () => {
+              setWaitingResponse(false);
+              setRecording(false);
+          };
+
+          sourceRef.current = ctx.createMediaStreamSource(stream);
+          processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
+          
+          processorRef.current.onaudioprocess = (e) => {
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  const inputData = e.inputBuffer.getChannelData(0);
+                  const pcmData = new Int16Array(inputData.length);
+                  for (let i = 0; i < inputData.length; i++) {
+                      pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                  }
+                  wsRef.current.send(pcmData.buffer);
+              }
+          };
+          
+          sourceRef.current.connect(processorRef.current);
+          processorRef.current.connect(ctx.destination);
+          
+      } catch(e) { console.error("Mic error", e); }
+  };
+
+  const stopRecording = (e) => {
+      if (e) e.preventDefault();
+      setRecording(false);
+      
+      // Stop mic but keep WS open for response
+      if (processorRef.current) {
+          processorRef.current.disconnect();
+          processorRef.current = null;
+      }
+      if (sourceRef.current) {
+          sourceRef.current.disconnect();
+          sourceRef.current = null;
+      }
+      if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+          streamRef.current = null;
+      }
+      
+      // If WS is open, send END signal and wait for response
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+          if (!hasSentEndRef.current) {
+              hasSentEndRef.current = true;
+              wsRef.current.send("END"); // Signal to backend that user is done speaking
+          }
+          setWaitingResponse(true);
+          responseTimeoutRef.current = setTimeout(() => {
+              closeConnection();
+          }, 10000);
+      }
+  };
 
   const handleGenerate = () => {
       setGenerating(true);
@@ -334,14 +511,40 @@ function AdminMode({ onBack }) {
       
       <div className="flex justify-between items-center mb-8">
         <h2 className="font-bold text-2xl flex items-center gap-2"><Settings/> Admin Tools</h2>
-        <button onClick={onBack} className="text-slate-500 hover:text-white px-3 py-2 rounded-lg hover:bg-slate-900">Exit</button>
+        <div className="flex gap-2">
+            <button onClick={onHistory} className="bg-slate-800 text-slate-300 hover:text-white px-4 py-2 rounded-lg hover:bg-slate-700 font-bold flex items-center gap-2"><History size={18}/> History</button>
+            <button onClick={onBack} className="text-slate-500 hover:text-white px-3 py-2 rounded-lg hover:bg-slate-900">Exit</button>
+        </div>
       </div>
 
       <div className="space-y-8 max-w-2xl mx-auto w-full">
           <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800">
               <h3 className="text-xl font-bold mb-4 flex items-center gap-2"><Wifi className="text-blue-500"/> AI Coach</h3>
+              
+              {/* Voice Chat Button */}
+              <div className="mb-6">
+                <button 
+                    onMouseDown={startRecording} onMouseUp={stopRecording} onMouseLeave={stopRecording}
+                    onTouchStart={startRecording} onTouchEnd={stopRecording}
+                    disabled={waitingResponse}
+                    className={`w-full py-6 rounded-2xl font-bold uppercase transition-all active:scale-95 shadow-lg flex items-center justify-center gap-3 ${
+                        waitingResponse ? 'bg-amber-600 text-white animate-pulse' :
+                        recording ? 'bg-red-600 text-white animate-pulse' : 
+                        'bg-indigo-600 text-white hover:bg-indigo-500'
+                    }`}
+                >
+                    <Mic size={24} />
+                    <span className="text-lg tracking-widest">
+                        {waitingResponse ? 'Pablo antwortet...' : recording ? 'Listening...' : 'Hold to Talk to Pablo'}
+                    </span>
+                </button>
+                <div className="text-center text-slate-500 text-xs mt-2 uppercase tracking-widest">Ask about history, inventory or get motivated</div>
+              </div>
+
+              <div className="border-t border-slate-800 my-6"></div>
+
               <div className="mb-4">
-                  <label className="block text-slate-400 text-sm mb-2">Instructions for Gem (optional)</label>
+                  <label className="block text-slate-400 text-sm mb-2">Instructions for new Workout (optional)</label>
                   <textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="e.g. 'Leg focused', 'Only 20 mins', 'Partner WOD'" className="w-full bg-slate-800 rounded-xl p-4 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 h-24 resize-none"/>
               </div>
               <button onClick={handleGenerate} disabled={generating} className={`w-full py-3 rounded-xl font-bold flex items-center justify-center gap-2 transition-all active:scale-95 ${generating ? 'bg-slate-700 text-slate-400' : 'bg-blue-600 hover:bg-blue-500 text-white'}`}>
@@ -405,26 +608,168 @@ function KidsMode({ user, onBack }) {
 function RemoteMode({ user, onBack }) {
   const { state, send } = useGymSocket();
   const [showLog, setShowLog] = useState(false);
+  
+  // Chat State
+  const [recording, setRecording] = useState(false);
+  const [waitingResponse, setWaitingResponse] = useState(false);
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const sourceRef = useRef(null);
+  const wsRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const responseTimeoutRef = useRef(null);
+  const hasSentEndRef = useRef(false);
+
+  const activeIndex = state.activePartIndex || 0;
+  const parts = state.workout?.parts || [];
+  const currentPart = parts[activeIndex];
+  const totalParts = parts.length;
+
+  const closeConnection = () => {
+      if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+      }
+      setWaitingResponse(false);
+  };
+
+  const playNextChunk = async () => {
+    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
+    responseTimeoutRef.current = setTimeout(() => {
+        closeConnection();
+    }, 2000);
+
+    if (audioQueueRef.current.length === 0) {
+        isPlayingRef.current = false;
+        return;
+    }
+    isPlayingRef.current = true;
+    const chunk = audioQueueRef.current.shift();
+    
+    try {
+        const audioCtx = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+        audioContextRef.current = audioCtx;
+        
+        const arrayBuffer = await chunk.arrayBuffer();
+        const int16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(int16.length);
+        for(let i=0; i<int16.length; i++) float32[i] = int16[i] / 32768.0;
+        
+        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+        
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        source.onended = playNextChunk;
+        source.start();
+        
+    } catch(e) { console.error("Audio playback error", e); isPlayingRef.current = false; }
+  };
+
+  const startRecording = async (e) => {
+      e.preventDefault();
+      if (waitingResponse) return;
+      hasSentEndRef.current = false;
+      
+      try {
+          if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+          const ctx = audioContextRef.current;
+          
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+              sampleRate: 16000,
+              channelCount: 1,
+              echoCancellation: true
+          }});
+          streamRef.current = stream;
+          
+          wsRef.current = new WebSocket(`ws://${HOST}:8000/live/audio`);
+          wsRef.current.binaryType = 'arraybuffer';
+          
+          wsRef.current.onopen = () => {
+              setRecording(true);
+              console.log("Connected to Live API");
+          };
+          
+          wsRef.current.onmessage = (event) => {
+              const audioBlob = new Blob([event.data], { type: 'audio/pcm' });
+              audioQueueRef.current.push(audioBlob);
+              if (!isPlayingRef.current) playNextChunk();
+          };
+          
+          wsRef.current.onclose = () => {
+              setWaitingResponse(false);
+              setRecording(false);
+          };
+
+          sourceRef.current = ctx.createMediaStreamSource(stream);
+          processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
+          
+          processorRef.current.onaudioprocess = (e) => {
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  const inputData = e.inputBuffer.getChannelData(0);
+                  const pcmData = new Int16Array(inputData.length);
+                  for (let i = 0; i < inputData.length; i++) {
+                      pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                  }
+                  wsRef.current.send(pcmData.buffer);
+              }
+          };
+          
+          sourceRef.current.connect(processorRef.current);
+          processorRef.current.connect(ctx.destination);
+          
+      } catch(e) { console.error("Mic error", e); }
+  };
+
+  const stopRecording = (e) => {
+      if (e) e.preventDefault();
+      setRecording(false);
+      
+      // Stop mic but keep WS open for response
+      if (processorRef.current) {
+          processorRef.current.disconnect();
+          processorRef.current = null;
+      }
+      if (sourceRef.current) {
+          sourceRef.current.disconnect();
+          sourceRef.current = null;
+      }
+      if (streamRef.current) {
+          streamRef.current.getTracks().forEach(t => t.stop());
+          streamRef.current = null;
+      }
+      
+      // If WS is open, send END signal and wait for response
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+          if (!hasSentEndRef.current) {
+              hasSentEndRef.current = true;
+              wsRef.current.send("END"); // Signal to backend that user is done speaking
+          }
+          setWaitingResponse(true);
+          responseTimeoutRef.current = setTimeout(() => {
+              closeConnection();
+          }, 10000);
+      }
+  };
 
   const handleLog = (data) => {
+      const exerciseName = currentPart?.exercise || currentPart?.type || 'WOD';
       fetch(`${API_URL}/log`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
               user_id: user.name,
               workout_id: 'current',
-              exercise: 'WOD',
+              exercise: exerciseName,
               result: data.result,
               feeling: data.feeling,
               notes: data.notes
           })
       }).catch(err => console.error(err));
   };
-
-  const activeIndex = state.activePartIndex || 0;
-  const parts = state.workout?.parts || [];
-  const currentPart = parts[activeIndex];
-  const totalParts = parts.length;
 
   const changePart = (delta) => {
       const newIndex = Math.max(0, Math.min(totalParts - 1, activeIndex + delta));
@@ -435,7 +780,7 @@ function RemoteMode({ user, onBack }) {
 
   return (
     <div className="min-h-screen bg-slate-950 text-white p-6 flex flex-col font-sans">
-      {showLog && <LogModal onClose={() => setShowLog(false)} onSave={handleLog} />}
+      {showLog && <LogModal onClose={() => setShowLog(false)} onSave={handleLog} part={currentPart} />}
       
       <div className="flex justify-between items-center mb-6">
         <div className="flex items-center gap-4">
@@ -461,6 +806,22 @@ function RemoteMode({ user, onBack }) {
                  <span className="mt-1 tracking-widest text-xs">{state.timerRunning ? 'Stop' : 'Start'}</span>
              </button>
          </div>
+
+         <button 
+            onMouseDown={startRecording} onMouseUp={stopRecording} onMouseLeave={stopRecording}
+            onTouchStart={startRecording} onTouchEnd={stopRecording}
+            disabled={waitingResponse}
+            className={`w-full h-20 rounded-3xl flex items-center justify-center gap-4 font-bold uppercase transition-all active:scale-95 shadow-lg select-none ${
+                waitingResponse ? 'bg-amber-600 text-white animate-pulse' :
+                recording ? 'bg-red-600 text-white animate-pulse' : 
+                'bg-indigo-600 text-white hover:bg-indigo-500'
+            }`}
+         >
+             <Mic size={32} />
+             <span className="text-xl tracking-widest">
+                 {waitingResponse ? 'Pablo antwortet...' : recording ? 'Listening...' : 'Talk to Pablo'}
+             </span>
+         </button>
 
          <div className="bg-slate-900 rounded-3xl p-5 border border-slate-800 flex-grow overflow-y-auto shadow-inner flex flex-col">
             <div className="flex justify-between items-center mb-3 border-b border-slate-800 pb-2 gap-2">
@@ -569,10 +930,12 @@ function TimerConfig({ onClose, onSave }) {
   );
 }
 
-function LogModal({ onClose, onSave, initialResult, timerMode }) {
+function LogModal({ onClose, onSave, initialResult, timerMode, part }) {
   const [result, setResult] = useState('');
   const [feeling, setFeeling] = useState('Good');
   const [notes, setNotes] = useState('');
+
+  const exerciseName = part?.exercise || part?.type || 'Workout';
 
   useEffect(() => {
       if (initialResult !== undefined && (timerMode === 'STOPWATCH' || timerMode === 'COUNTDOWN')) {
@@ -603,6 +966,12 @@ function LogModal({ onClose, onSave, initialResult, timerMode }) {
           <button onClick={onClose}><X size={24}/></button>
         </div>
 
+        <div className="mb-4 bg-slate-800 p-3 rounded-xl border border-slate-700">
+            <div className="text-slate-400 text-xs font-bold uppercase tracking-widest">Exercise</div>
+            <div className="text-white font-bold text-lg">{exerciseName}</div>
+            {part?.scheme && <div className="text-yellow-500 text-sm">{part.scheme}</div>}
+        </div>
+
         <div className="mb-6">
            <label className="block text-slate-400 text-sm mb-2">How did it feel?</label>
            <div className="grid grid-cols-4 gap-2">
@@ -630,6 +999,94 @@ function LogModal({ onClose, onSave, initialResult, timerMode }) {
           <Check size={24}/> Save Log
         </button>
       </div>
+    </div>
+  );
+}
+
+function HistoryMode({ onBack }) {
+  const [workouts, setWorkouts] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`${API_URL}/history`)
+      .then(res => res.json())
+      .then(data => {
+        setWorkouts(data);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white p-6 flex flex-col font-sans">
+      <div className="flex justify-between items-center mb-8">
+        <h2 className="font-bold text-2xl flex items-center gap-2"><History/> Workout History</h2>
+        <button onClick={onBack} className="text-slate-500 hover:text-white px-3 py-2 rounded-lg hover:bg-slate-900">Back</button>
+      </div>
+
+      {loading ? (
+          <div className="text-center text-slate-500 mt-20">Loading history...</div>
+      ) : (
+        <div className="space-y-6 max-w-3xl mx-auto w-full">
+            {workouts.map(w => (
+                <div key={w.id} className="bg-slate-900 rounded-3xl p-6 border border-slate-800">
+                    <div className="flex justify-between items-start mb-4">
+                        <div>
+                            <div className="text-slate-500 text-sm font-bold uppercase tracking-widest mb-1">{w.date}</div>
+                            <h3 className="text-xl font-bold text-white">{w.plan?.focus || 'Workout'}</h3>
+                        </div>
+                        <div className="text-xs text-slate-600 font-mono">{w.created_at.substring(11,16)}</div>
+                    </div>
+
+                    {w.plan?.reasoning && (
+                        <div className="bg-blue-900/20 border border-blue-500/30 p-4 rounded-xl mb-6">
+                            <div className="text-blue-400 text-xs font-bold uppercase tracking-widest mb-2 flex items-center gap-2">
+                                <Monitor size={14}/> Coach's Reasoning
+                            </div>
+                            <p className="text-blue-100 text-sm italic">"{w.plan.reasoning}"</p>
+                        </div>
+                    )}
+
+                    <div className="mb-6 space-y-2">
+                        {w.plan?.parts?.map((p, i) => (
+                            <div key={i} className="flex items-center gap-2 text-sm text-slate-400">
+                                <span className="bg-slate-800 px-2 py-1 rounded text-xs font-bold">{p.type}</span>
+                                <span>{p.duration_min}min</span>
+                                <span className="text-slate-500">•</span>
+                                <span className="text-slate-300 truncate">{p.format || 'Standard'}</span>
+                            </div>
+                        ))}
+                    </div>
+
+                    {w.logs && w.logs.length > 0 && (
+                        <div className="border-t border-slate-800 pt-4">
+                            <h4 className="text-slate-500 text-xs font-bold uppercase tracking-widest mb-3">Results</h4>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                {w.logs.map((log, i) => (
+                                    <div key={i} className="bg-slate-950 p-3 rounded-xl flex items-center gap-3">
+                                        <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center font-bold text-xs text-slate-300">
+                                            {log.user_id.substring(0,2).toUpperCase()}
+                                        </div>
+                                        <div className="flex-grow">
+                                            <div className="font-bold text-sm text-white">{log.result}</div>
+                                            {log.notes && <div className="text-xs text-slate-500 truncate">{log.notes}</div>}
+                                        </div>
+                                        <div className="text-lg" title={log.feeling}>{
+                                            log.feeling === 'Easy' ? '😎' :
+                                            log.feeling === 'Good' ? '💪' :
+                                            log.feeling === 'Hard' ? '🥵' :
+                                            log.feeling === 'Dead' ? '💀' : ''
+                                        }</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            ))}
+            {workouts.length === 0 && <div className="text-center text-slate-500 italic">No workouts recorded yet.</div>}
+        </div>
+      )}
     </div>
   );
 }
